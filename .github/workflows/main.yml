@@ -1,0 +1,268 @@
+name: Gatling Performance Test (E-Commerce Demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      format:
+        description: 'Configuration format (env or json)'
+        required: true
+        type: string
+        default: 'env'
+      config:
+        description: 'Test configuration'
+        required: true
+        type: string
+
+jobs:
+  performance-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Print trigger information
+        run: |
+          echo "=================================="
+          echo "🚀 Gatling E-Commerce Demo Test"
+          echo "=================================="
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "=================================="
+
+      - name: Validate configuration format
+        run: |
+          FORMAT="${{ inputs.format }}"
+          
+          if [ "$FORMAT" != "env" ] && [ "$FORMAT" != "json" ]; then
+            echo "❌ Error: Invalid format '$FORMAT'"
+            exit 1
+          fi
+          
+          echo "✅ Configuration format: $FORMAT"
+
+      - name: Generate .env file
+        run: |
+          echo "📝 Writing configuration to .env file..."
+          
+          cat > .env << 'EOF'
+          ${{ inputs.config }}
+          EOF
+          
+          echo "✅ .env file created"
+          echo ""
+          echo "=================================="
+          echo "📄 Configuration:"
+          echo "=================================="
+          cat .env
+          echo "=================================="
+
+      - name: Validate .env file
+        run: |
+          echo "🔍 Validating environment variables..."
+          
+          set -a
+          source .env
+          set +a
+          
+          # Check required variables
+          REQUIRED_VARS=("SCENARIO" "LOAD_USERS" "LOAD_DURATION")
+          MISSING_VARS=()
+          
+          for VAR in "${REQUIRED_VARS[@]}"; do
+            if [ -z "${!VAR}" ]; then
+              MISSING_VARS+=("$VAR")
+            else
+              echo "✅ $VAR=${!VAR}"
+            fi
+          done
+          
+          if [ ${#MISSING_VARS[@]} -ne 0 ]; then
+            echo "❌ Missing variables: ${MISSING_VARS[*]}"
+            exit 1
+          fi
+          
+          echo "✅ Validation passed"
+
+      - name: Display test configuration
+        run: |
+          set -a
+          source .env
+          set +a
+          
+          echo "=================================="
+          echo "📊 Test Configuration"
+          echo "=================================="
+          echo "Load Type:     $LOAD_TYPE"
+          echo "Scenario:      $SCENARIO"
+          echo "Users:         $LOAD_USERS"
+          echo "Duration:      ${LOAD_DURATION}s ($(($LOAD_DURATION / 60))min)"
+          echo "Ramp Up:       ${LOAD_RAMP_UP}s"
+          echo "=================================="
+
+      - name: Clone Gatling demo repository
+        run: |
+          echo "📥 Cloning Gatling e-commerce demo..."
+          git clone https://github.com/gatling/se-ecommerce-demo-gatling-tests.git
+          
+          echo "✅ Repository cloned"
+          ls -la se-ecommerce-demo-gatling-tests/
+
+      - name: Copy .env to demo project
+        run: |
+          cp .env se-ecommerce-demo-gatling-tests/java/maven/.env
+          echo "✅ .env copied to Maven project"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run Gatling test in Docker
+        run: |
+          echo "=================================="
+          echo "🐳 Starting Gatling Test"
+          echo "=================================="
+          
+          set -a
+          source .env
+          set +a
+          
+          echo "Running: $SCENARIO"
+          echo ""
+          
+          docker run --rm \
+            --name gatling-test-${{ github.run_id }} \
+            --env-file .env \
+            -v "$(pwd)/se-ecommerce-demo-gatling-tests/java/maven":/workspace \
+            -w /workspace \
+            maven:3.9-openjdk-17-slim \
+            /bin/bash -c '
+              set -a
+              source .env
+              set +a
+              
+              echo "=================================="
+              echo "Java & Maven Info"
+              echo "=================================="
+              java -version
+              mvn -version
+              echo ""
+              
+              echo "=================================="
+              echo "Project Structure"
+              echo "=================================="
+              ls -la
+              echo ""
+              
+              echo "=================================="
+              echo "Installing Dependencies"
+              echo "=================================="
+              mvn clean install -DskipTests -B
+              echo ""
+              
+              echo "=================================="
+              echo "Starting Gatling Simulation"
+              echo "=================================="
+              echo "Simulation Class: $SCENARIO"
+              echo "Users: $LOAD_USERS"
+              echo "Duration: ${LOAD_DURATION}s"
+              echo "Ramp Up: ${LOAD_RAMP_UP}s"
+              echo "=================================="
+              echo ""
+              
+              # Run Gatling with parameters
+              mvn gatling:test \
+                -Dgatling.simulationClass=$SCENARIO \
+                -Dusers=${LOAD_USERS:-10} \
+                -Dduration=${LOAD_DURATION:-60} \
+                -DrampUp=${LOAD_RAMP_UP:-10}
+            '
+          
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo ""
+            echo "✅ Test completed successfully"
+          else
+            echo ""
+            echo "❌ Test failed with exit code: $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+
+      - name: Copy results from Docker volume
+        if: always()
+        run: |
+          echo "📁 Checking for Gatling results..."
+          
+          RESULTS_DIR="se-ecommerce-demo-gatling-tests/java/maven/target/gatling"
+          
+          if [ -d "$RESULTS_DIR" ]; then
+            echo "✅ Results found:"
+            find "$RESULTS_DIR" -type f -name "*.html" -o -name "*.log" | head -20
+            
+            # Copy to workspace root for easier artifact upload
+            mkdir -p gatling-results
+            cp -r "$RESULTS_DIR"/* gatling-results/ || true
+          else
+            echo "⚠️  No results directory found"
+          fi
+
+      - name: Display results summary
+        if: always()
+        run: |
+          RESULTS_DIR="gatling-results"
+          
+          if [ -d "$RESULTS_DIR" ]; then
+            echo "=================================="
+            echo "📊 Test Results Summary"
+            echo "=================================="
+            
+            # Find the latest simulation directory
+            LATEST_SIM=$(ls -t "$RESULTS_DIR" | head -1)
+            
+            if [ -n "$LATEST_SIM" ]; then
+              echo "Simulation: $LATEST_SIM"
+              echo ""
+              echo "Generated files:"
+              ls -lh "$RESULTS_DIR/$LATEST_SIM/"
+              
+              # Try to extract basic stats if simulation.log exists
+              if [ -f "$RESULTS_DIR/$LATEST_SIM/simulation.log" ]; then
+                echo ""
+                echo "Basic Statistics:"
+                TOTAL_REQUESTS=$(grep -c "REQUEST" "$RESULTS_DIR/$LATEST_SIM/simulation.log" || echo "0")
+                echo "  Total requests: $TOTAL_REQUESTS"
+              fi
+            fi
+            
+            echo "=================================="
+          fi
+
+      - name: Upload Gatling results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatling-results-${{ github.run_id }}
+          path: gatling-results/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Gatling HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatling-html-report-${{ github.run_id }}
+          path: gatling-results/*/index.html
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Final status
+        if: always()
+        run: |
+          echo "=================================="
+          echo "🏁 Workflow Complete"
+          echo "=================================="
+          echo "Status: ${{ job.status }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo ""
+          echo "📊 Download artifacts to view Gatling HTML reports"
+          echo "=================================="

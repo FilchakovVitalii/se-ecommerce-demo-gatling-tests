@@ -134,7 +134,7 @@ jobs:
             --env-file .env \
             -v "$(pwd)/se-ecommerce-demo-gatling-tests/java/maven":/workspace \
             -w /workspace \
-            maven:3.9-openjdk-17-slim \
+            maven:3.9-eclipse-temurin-17 \
             /bin/bash -c '
               set -a
               source .env
